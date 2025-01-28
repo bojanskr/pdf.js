@@ -1,17 +1,14 @@
 import { types as t, transformSync } from "@babel/core";
-import fs from "fs";
-import { join as joinPaths } from "path";
 import vm from "vm";
 
 const PDFJS_PREPROCESSOR_NAME = "PDFJSDev";
-const ROOT_PREFIX = "$ROOT/";
 
 function isPDFJSPreprocessor(obj) {
   return obj.type === "Identifier" && obj.name === PDFJS_PREPROCESSOR_NAME;
 }
 
 function evalWithDefines(code, defines) {
-  if (!code || !code.trim()) {
+  if (!code?.trim()) {
     throw new Error("No JavaScript expression given");
   }
   return vm.runInNewContext(code, defines, { displayErrors: false });
@@ -40,28 +37,11 @@ function handlePreprocessorAction(ctx, actionName, args, path) {
           return result;
         }
         break;
-      case "json":
-        if (!t.isStringLiteral(arg)) {
-          throw new Error("Path to JSON is not provided");
-        }
-        let jsonPath = arg.value;
-        if (jsonPath.startsWith(ROOT_PREFIX)) {
-          jsonPath = joinPaths(
-            ctx.rootPath,
-            jsonPath.substring(ROOT_PREFIX.length)
-          );
-        }
-        return JSON.parse(fs.readFileSync(jsonPath, "utf8"));
     }
     throw new Error("Unsupported action");
   } catch (e) {
     throw path.buildCodeFrameError(
-      "Could not process " +
-        PDFJS_PREPROCESSOR_NAME +
-        "." +
-        actionName +
-        ": " +
-        e.message
+      `Could not process ${PDFJS_PREPROCESSOR_NAME}.${actionName}: ${e.message}`
     );
   }
 }
@@ -84,25 +64,32 @@ function babelPluginPDFJSPreprocessor(babel, ctx) {
           if (t.isBooleanLiteral(node.test)) {
             // if (true) stmt1; => stmt1
             // if (false) stmt1; else stmt2; => stmt2
-            path.replaceWith(
-              node.test.value === true
-                ? node.consequent
-                : node.alternate || t.emptyStatement()
-            );
+            if (node.test.value === true) {
+              path.replaceWith(node.consequent);
+            } else if (node.alternate) {
+              path.replaceWith(node.alternate);
+            } else {
+              path.remove(node);
+            }
           }
         },
       },
-      UnaryExpression(path) {
-        const { node } = path;
-        if (node.operator === "typeof" && isPDFJSPreprocessor(node.argument)) {
-          // typeof PDFJSDev => 'object'
-          path.replaceWith(t.stringLiteral("object"));
-          return;
-        }
-        if (node.operator === "!" && t.isBooleanLiteral(node.argument)) {
-          // !true => false,  !false => true
-          path.replaceWith(t.booleanLiteral(!node.argument.value));
-        }
+      UnaryExpression: {
+        exit(path) {
+          const { node } = path;
+          if (
+            node.operator === "typeof" &&
+            isPDFJSPreprocessor(node.argument)
+          ) {
+            // typeof PDFJSDev => 'object'
+            path.replaceWith(t.stringLiteral("object"));
+            return;
+          }
+          if (node.operator === "!" && t.isBooleanLiteral(node.argument)) {
+            // !true => false,  !false => true
+            path.replaceWith(t.booleanLiteral(!node.argument.value));
+          }
+        },
       },
       LogicalExpression: {
         exit(path) {
@@ -166,18 +153,23 @@ function babelPluginPDFJSPreprocessor(babel, ctx) {
           path.replaceWith(t.inherits(t.valueToNode(result), path.node));
         }
 
-        // require('string')
-        if (
-          t.isIdentifier(node.callee, { name: "require" }) &&
-          node.arguments.length === 1 &&
-          t.isStringLiteral(node.arguments[0]) &&
-          ctx.map?.[node.arguments[0].value]
-        ) {
-          const requireName = node.arguments[0];
-          requireName.value = requireName.raw = ctx.map[requireName.value];
+        if (t.isIdentifier(node.callee, { name: "__non_webpack_import__" })) {
+          if (node.arguments.length !== 1) {
+            throw new Error("Invalid `__non_webpack_import__` usage.");
+          }
+          // Replace it with a standard `import`-call and
+          // ensure that Webpack will leave it alone.
+          const source = node.arguments[0];
+          source.leadingComments = [
+            {
+              type: "CommentBlock",
+              value: "webpackIgnore: true",
+            },
+          ];
+          path.replaceWith(t.importExpression(source));
         }
       },
-      BlockStatement: {
+      "BlockStatement|StaticBlock": {
         // Visit node in post-order so that recursive flattening
         // of blocks works correctly.
         exit(path) {
@@ -208,6 +200,10 @@ function babelPluginPDFJSPreprocessor(babel, ctx) {
             }
             subExpressionIndex++;
           }
+
+          if (node.type === "StaticBlock" && node.body.length === 0) {
+            path.remove();
+          }
         },
       },
       Function: {
@@ -224,6 +220,26 @@ function babelPluginPDFJSPreprocessor(babel, ctx) {
           ) {
             // Function body ends with return without arg -- removing it.
             body.pop();
+          }
+        },
+      },
+      ClassMethod: {
+        exit(path) {
+          const {
+            node,
+            parentPath: { parent: classNode },
+          } = path;
+          if (
+            // Remove empty constructors. We only do this for
+            // base classes, as the default constructor of derived
+            // classes is not empty (and an empty constructor
+            // must throw at runtime when constructed).
+            node.kind === "constructor" &&
+            node.body.body.length === 0 &&
+            node.params.every(p => p.type === "Identifier") &&
+            !classNode.superClass
+          ) {
+            path.remove();
           }
         },
       },
