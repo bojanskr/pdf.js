@@ -14,6 +14,7 @@
  */
 
 import {
+  serializeError,
   USERACTIVATION_CALLBACKID,
   USERACTIVATION_MAXTIME_VALIDITY,
 } from "./app_utils.js";
@@ -81,6 +82,15 @@ class EventDispatcher {
   }
 
   dispatch(baseEvent) {
+    if (
+      typeof PDFJSDev !== "undefined" &&
+      PDFJSDev.test("TESTING") &&
+      baseEvent.name === "sandboxtripbegin"
+    ) {
+      this._externalCall("send", [{ command: "sandboxTripEnd" }]);
+      return;
+    }
+
     const id = baseEvent.id;
     if (!(id in this._objects)) {
       let event;
@@ -233,7 +243,7 @@ class EventDispatcher {
     // Run format actions if any for all the fields.
     const event = (globalThis.event = new Event({}));
     for (const source of Object.values(this._objects)) {
-      event.value = source.obj.value;
+      event.value = source.obj._getValue();
       this.runActions(source, source, event, "Format");
     }
   }
@@ -245,8 +255,7 @@ class EventDispatcher {
 
       this.runCalculate(source, event);
 
-      const savedValue = source.obj._getValue();
-      event.value = source.obj.value;
+      const savedValue = (event.value = source.obj._getValue());
       let formattedValue = null;
 
       if (this.runActions(source, source, event, "Format")) {
@@ -336,7 +345,15 @@ class EventDispatcher {
       event.value = null;
       const target = this._objects[targetId];
       let savedValue = target.obj._getValue();
-      this.runActions(source, target, event, "Calculate");
+      try {
+        this.runActions(source, target, event, "Calculate");
+      } catch (error) {
+        const fieldId = target.obj._id;
+        const serializedError = serializeError(error);
+        serializedError.value = `Error when calculating value for field "${fieldId}"\n${serializedError.value}`;
+        this._externalCall("send", [serializedError]);
+        continue;
+      }
       if (!event.rc) {
         continue;
       }

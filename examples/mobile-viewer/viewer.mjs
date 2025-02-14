@@ -91,10 +91,10 @@ const PDFViewerApplication = {
         let key = "pdfjs-loading-error";
         if (reason instanceof pdfjsLib.InvalidPDFException) {
           key = "pdfjs-invalid-file-error";
-        } else if (reason instanceof pdfjsLib.MissingPDFException) {
-          key = "pdfjs-missing-file-error";
-        } else if (reason instanceof pdfjsLib.UnexpectedResponseException) {
-          key = "pdfjs-unexpected-response-error";
+        } else if (reason instanceof pdfjsLib.ResponseException) {
+          key = reason.missing
+            ? "pdfjs-missing-file-error"
+            : "pdfjs-unexpected-response-error";
         }
         self.l10n.get(key).then(msg => {
           self.error(msg, { message: reason?.message });
@@ -272,7 +272,7 @@ const PDFViewerApplication = {
     });
     this.pdfLinkService = linkService;
 
-    this.l10n = pdfjsViewer.NullL10n;
+    this.l10n = new pdfjsViewer.GenericL10n();
 
     const container = document.getElementById("viewerContainer");
     const pdfViewer = new pdfjsViewer.PDFViewer({

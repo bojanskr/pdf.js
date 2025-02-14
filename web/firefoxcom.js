@@ -14,16 +14,21 @@
  */
 
 import { isPdfFile, PDFDataRangeTransport } from "pdfjs-lib";
+import { AppOptions } from "./app_options.js";
 import { BaseExternalServices } from "./external_services.js";
 import { BasePreferences } from "./preferences.js";
 import { DEFAULT_SCALE_VALUE } from "./ui_utils.js";
 import { L10n } from "./l10n.js";
-import { PDFViewerApplication } from "./app.js";
 
 if (typeof PDFJSDev === "undefined" || !PDFJSDev.test("MOZCENTRAL")) {
   throw new Error(
     'Module "./firefoxcom.js" shall not be used outside MOZCENTRAL builds.'
   );
+}
+
+let viewerApp = { initialized: false };
+function initCom(app) {
+  viewerApp = app;
 }
 
 class FirefoxCom {
@@ -78,14 +83,6 @@ class FirefoxCom {
 class DownloadManager {
   #openBlobUrls = new WeakMap();
 
-  downloadUrl(url, filename, options = {}) {
-    FirefoxCom.request("download", {
-      originalUrl: url,
-      filename,
-      options,
-    });
-  }
-
   downloadData(data, filename, contentType) {
     const blobUrl = URL.createObjectURL(
       new Blob([data], { type: contentType })
@@ -124,7 +121,7 @@ class DownloadManager {
         window.open(viewerUrl);
         return true;
       } catch (ex) {
-        console.error(`openOrDownloadData: ${ex}`);
+        console.error("openOrDownloadData:", ex);
         // Release the `blobUrl`, since opening it failed, and fallback to
         // downloading the PDF file.
         URL.revokeObjectURL(blobUrl);
@@ -136,14 +133,15 @@ class DownloadManager {
     return false;
   }
 
-  download(blob, url, filename, options = {}) {
-    const blobUrl = URL.createObjectURL(blob);
+  download(data, url, filename) {
+    const blobUrl = data
+      ? URL.createObjectURL(new Blob([data], { type: "application/pdf" }))
+      : null;
 
     FirefoxCom.request("download", {
       blobUrl,
       originalUrl: url,
       filename,
-      options,
     });
   }
 }
@@ -151,6 +149,10 @@ class DownloadManager {
 class Preferences extends BasePreferences {
   async _readFromStorage(prefObj) {
     return FirefoxCom.requestAsync("getPreferences", prefObj);
+  }
+
+  async _writeToStorage(prefObj) {
+    return FirefoxCom.requestAsync("setPreferences", prefObj);
   }
 }
 
@@ -167,14 +169,14 @@ class Preferences extends BasePreferences {
   const findLen = "find".length;
 
   const handleEvent = function ({ type, detail }) {
-    if (!PDFViewerApplication.initialized) {
+    if (!viewerApp.initialized) {
       return;
     }
     if (type === "findbarclose") {
-      PDFViewerApplication.eventBus.dispatch(type, { source: window });
+      viewerApp.eventBus.dispatch(type, { source: window });
       return;
     }
-    PDFViewerApplication.eventBus.dispatch("find", {
+    viewerApp.eventBus.dispatch("find", {
       source: window,
       type: type.substring(findLen),
       query: detail.query,
@@ -194,18 +196,18 @@ class Preferences extends BasePreferences {
 (function listenZoomEvents() {
   const events = ["zoomin", "zoomout", "zoomreset"];
   const handleEvent = function ({ type, detail }) {
-    if (!PDFViewerApplication.initialized) {
+    if (!viewerApp.initialized) {
       return;
     }
     // Avoid attempting to needlessly reset the zoom level *twice* in a row,
     // when using the `Ctrl + 0` keyboard shortcut.
     if (
       type === "zoomreset" &&
-      PDFViewerApplication.pdfViewer.currentScaleValue === DEFAULT_SCALE_VALUE
+      viewerApp.pdfViewer.currentScaleValue === DEFAULT_SCALE_VALUE
     ) {
       return;
     }
-    PDFViewerApplication.eventBus.dispatch(type, { source: window });
+    viewerApp.eventBus.dispatch(type, { source: window });
   };
 
   for (const event of events) {
@@ -215,10 +217,10 @@ class Preferences extends BasePreferences {
 
 (function listenSaveEvent() {
   const handleEvent = function ({ type, detail }) {
-    if (!PDFViewerApplication.initialized) {
+    if (!viewerApp.initialized) {
       return;
     }
-    PDFViewerApplication.eventBus.dispatch("download", { source: window });
+    viewerApp.eventBus.dispatch("download", { source: window });
   };
 
   window.addEventListener("save", handleEvent);
@@ -226,10 +228,10 @@ class Preferences extends BasePreferences {
 
 (function listenEditingEvent() {
   const handleEvent = function ({ detail }) {
-    if (!PDFViewerApplication.initialized) {
+    if (!viewerApp.initialized) {
       return;
     }
-    PDFViewerApplication.eventBus.dispatch("editingaction", {
+    viewerApp.eventBus.dispatch("editingaction", {
       source: window,
       name: detail.name,
     });
@@ -242,9 +244,9 @@ if (PDFJSDev.test("GECKOVIEW")) {
   (function listenQueryEvents() {
     window.addEventListener("pdf.js.query", async ({ detail: { queryId } }) => {
       let result = null;
-      if (queryId === "canDownloadInsteadOfPrint") {
+      if (viewerApp.initialized && queryId === "canDownloadInsteadOfPrint") {
         result = false;
-        const { pdfDocument, pdfViewer } = PDFViewerApplication;
+        const { pdfDocument, pdfViewer } = viewerApp;
         if (pdfDocument) {
           try {
             const hasUnchangedAnnotations =
@@ -254,14 +256,8 @@ if (PDFJSDev.test("GECKOVIEW")) {
             const hasWillPrint =
               pdfViewer.enableScripting &&
               !!(await pdfDocument.getJSActions())?.WillPrint;
-            const hasUnchangedOptionalContent = (
-              await pdfViewer.optionalContentConfigPromise
-            ).hasInitialVisibility;
 
-            result =
-              hasUnchangedAnnotations &&
-              !hasWillPrint &&
-              hasUnchangedOptionalContent;
+            result = hasUnchangedAnnotations && !hasWillPrint;
           } catch {
             console.warn("Unable to check if the document can be downloaded.");
           }
@@ -310,6 +306,268 @@ class FirefoxScripting {
   }
 }
 
+class MLManager {
+  #abortSignal = null;
+
+  #enabled = null;
+
+  #eventBus = null;
+
+  #ready = null;
+
+  #requestResolvers = null;
+
+  hasProgress = false;
+
+  static #AI_ALT_TEXT_MODEL_NAME = "moz-image-to-text";
+
+  constructor({
+    altTextLearnMoreUrl,
+    enableGuessAltText,
+    enableAltTextModelDownload,
+  }) {
+    // The `altTextLearnMoreUrl` is used to provide a link to the user to learn
+    // more about the "alt text" feature.
+    // The link is used in the Alt Text dialog or in the Image Settings.
+    this.altTextLearnMoreUrl = altTextLearnMoreUrl;
+    this.enableAltTextModelDownload = enableAltTextModelDownload;
+    this.enableGuessAltText = enableGuessAltText;
+  }
+
+  setEventBus(eventBus, abortSignal) {
+    this.#eventBus = eventBus;
+    this.#abortSignal = abortSignal;
+    eventBus._on(
+      "enablealttextmodeldownload",
+      ({ value }) => {
+        if (this.enableAltTextModelDownload === value) {
+          return;
+        }
+        if (value) {
+          this.downloadModel("altText");
+        } else {
+          this.deleteModel("altText");
+        }
+      },
+      { signal: abortSignal }
+    );
+    eventBus._on(
+      "enableguessalttext",
+      ({ value }) => {
+        this.toggleService("altText", value);
+      },
+      { signal: abortSignal }
+    );
+  }
+
+  async isEnabledFor(name) {
+    return this.enableGuessAltText && !!(await this.#enabled?.get(name));
+  }
+
+  isReady(name) {
+    return this.#ready?.has(name) ?? false;
+  }
+
+  async deleteModel(name) {
+    if (name !== "altText" || !this.enableAltTextModelDownload) {
+      return;
+    }
+    this.enableAltTextModelDownload = false;
+    this.#ready?.delete(name);
+    this.#enabled?.delete(name);
+    await this.toggleService("altText", false);
+    await FirefoxCom.requestAsync(
+      "mlDelete",
+      MLManager.#AI_ALT_TEXT_MODEL_NAME
+    );
+  }
+
+  async loadModel(name) {
+    if (name === "altText" && this.enableAltTextModelDownload) {
+      await this.#loadAltTextEngine(false);
+    }
+  }
+
+  async downloadModel(name) {
+    if (name !== "altText" || this.enableAltTextModelDownload) {
+      return null;
+    }
+    this.enableAltTextModelDownload = true;
+    return this.#loadAltTextEngine(true);
+  }
+
+  async guess(data) {
+    if (data?.name !== "altText") {
+      return null;
+    }
+    const resolvers = (this.#requestResolvers ||= new Set());
+    const resolver = Promise.withResolvers();
+    resolvers.add(resolver);
+
+    data.service = MLManager.#AI_ALT_TEXT_MODEL_NAME;
+
+    FirefoxCom.requestAsync("mlGuess", data)
+      .then(response => {
+        if (resolvers.has(resolver)) {
+          resolver.resolve(response);
+          resolvers.delete(resolver);
+        }
+      })
+      .catch(reason => {
+        if (resolvers.has(resolver)) {
+          resolver.reject(reason);
+          resolvers.delete(resolver);
+        }
+      });
+
+    return resolver.promise;
+  }
+
+  async #cancelAllRequests() {
+    if (!this.#requestResolvers) {
+      return;
+    }
+    for (const resolver of this.#requestResolvers) {
+      resolver.resolve({ cancel: true });
+    }
+    this.#requestResolvers.clear();
+    this.#requestResolvers = null;
+  }
+
+  async toggleService(name, enabled) {
+    if (name !== "altText" || this.enableGuessAltText === enabled) {
+      return;
+    }
+
+    this.enableGuessAltText = enabled;
+    if (enabled) {
+      if (this.enableAltTextModelDownload) {
+        await this.#loadAltTextEngine(false);
+      }
+    } else {
+      this.#cancelAllRequests();
+    }
+  }
+
+  async #loadAltTextEngine(listenToProgress) {
+    if (this.#enabled?.has("altText")) {
+      // We already have a promise for the "altText" service.
+      return;
+    }
+    this.#ready ||= new Set();
+    const promise = FirefoxCom.requestAsync("loadAIEngine", {
+      service: MLManager.#AI_ALT_TEXT_MODEL_NAME,
+      listenToProgress,
+    }).then(ok => {
+      if (ok) {
+        this.#ready.add("altText");
+      }
+      return ok;
+    });
+    (this.#enabled ||= new Map()).set("altText", promise);
+    if (listenToProgress) {
+      const ac = new AbortController();
+      const signal = AbortSignal.any([this.#abortSignal, ac.signal]);
+
+      this.hasProgress = true;
+      window.addEventListener(
+        "loadAIEngineProgress",
+        ({ detail }) => {
+          this.#eventBus.dispatch("loadaiengineprogress", {
+            source: this,
+            detail,
+          });
+          if (detail.finished) {
+            ac.abort();
+            this.hasProgress = false;
+          }
+        },
+        { signal }
+      );
+      promise.then(ok => {
+        if (!ok) {
+          ac.abort();
+          this.hasProgress = false;
+        }
+      });
+    }
+    await promise;
+  }
+}
+
+class SignatureStorage {
+  #eventBus = null;
+
+  #signatures = null;
+
+  #signal = null;
+
+  constructor(eventBus, signal) {
+    this.#eventBus = eventBus;
+    this.#signal = signal;
+  }
+
+  #handleSignature(data) {
+    return FirefoxCom.requestAsync("handleSignature", data);
+  }
+
+  async getAll() {
+    if (this.#signal) {
+      window.addEventListener(
+        "storedSignaturesChanged",
+        () => {
+          this.#signatures = null;
+          this.#eventBus?.dispatch("storedsignatureschanged", { source: this });
+        },
+        { signal: this.#signal }
+      );
+      this.#signal = null;
+    }
+    if (!this.#signatures) {
+      this.#signatures = new Map();
+      const data = await this.#handleSignature({ action: "get" });
+      if (data) {
+        for (const { uuid, description, signatureData } of data) {
+          this.#signatures.set(uuid, { description, signatureData });
+        }
+      }
+    }
+    return this.#signatures;
+  }
+
+  async isFull() {
+    // We want to store at most 5 signatures.
+    return (await this.getAll()).size === 5;
+  }
+
+  async create(data) {
+    if (await this.isFull()) {
+      return null;
+    }
+    const uuid = await this.#handleSignature({
+      action: "create",
+      ...data,
+    });
+    if (!uuid) {
+      return null;
+    }
+    this.#signatures.set(uuid, data);
+    return uuid;
+  }
+
+  async delete(uuid) {
+    const signatures = await this.getAll();
+    if (!signatures.has(uuid)) {
+      return false;
+    }
+    if (await this.#handleSignature({ action: "delete", uuid })) {
+      signatures.delete(uuid);
+      return true;
+    }
+    return false;
+  }
+}
+
 class ExternalServices extends BaseExternalServices {
   updateFindControlState(data) {
     FirefoxCom.request("updateFindControlState", data);
@@ -319,7 +577,7 @@ class ExternalServices extends BaseExternalServices {
     FirefoxCom.request("updateFindMatchesCount", data);
   }
 
-  initPassiveLoading(callbacks) {
+  initPassiveLoading() {
     let pdfDataRangeTransport;
 
     window.addEventListener("message", function windowMessage(e) {
@@ -336,7 +594,7 @@ class ExternalServices extends BaseExternalServices {
       switch (args.pdfjsLoadAction) {
         case "supportsRangedLoading":
           if (args.done && !args.data) {
-            callbacks.onError();
+            viewerApp._documentError(null);
             break;
           }
           pdfDataRangeTransport = new FirefoxComDataRangeTransport(
@@ -346,7 +604,7 @@ class ExternalServices extends BaseExternalServices {
             args.filename
           );
 
-          callbacks.onOpenWithTransport(pdfDataRangeTransport);
+          viewerApp.open({ range: pdfDataRangeTransport });
           break;
         case "range":
           pdfDataRangeTransport.onDataRange(args.begin, args.chunk);
@@ -365,14 +623,14 @@ class ExternalServices extends BaseExternalServices {
           pdfDataRangeTransport?.onDataProgressiveDone();
           break;
         case "progress":
-          callbacks.onProgress(args.loaded, args.total);
+          viewerApp.progress(args.loaded / args.total);
           break;
         case "complete":
           if (!args.data) {
-            callbacks.onError(args.errorCode);
+            viewerApp._documentError(null, { message: args.errorCode });
             break;
           }
-          callbacks.onOpenWithData(args.data, args.filename);
+          viewerApp.open({ data: args.data, filename: args.filename });
           break;
       }
     });
@@ -380,7 +638,7 @@ class ExternalServices extends BaseExternalServices {
   }
 
   reportTelemetry(data) {
-    FirefoxCom.request("reportTelemetry", JSON.stringify(data));
+    FirefoxCom.request("reportTelemetry", data);
   }
 
   updateEditorStates(data) {
@@ -388,27 +646,21 @@ class ExternalServices extends BaseExternalServices {
   }
 
   async createL10n() {
-    const [localeProperties] = await Promise.all([
-      FirefoxCom.requestAsync("getLocaleProperties", null),
-      document.l10n.ready,
-    ]);
-    return new L10n(localeProperties, document.l10n);
+    await document.l10n.ready;
+    return new L10n(AppOptions.get("localeProperties"), document.l10n);
   }
 
   createScripting() {
     return FirefoxScripting;
   }
 
-  async getNimbusExperimentData() {
-    if (typeof PDFJSDev === "undefined" || !PDFJSDev.test("GECKOVIEW")) {
-      return null;
-    }
-    const nimbusData = await FirefoxCom.requestAsync(
-      "getNimbusExperimentData",
-      null
-    );
-    return nimbusData && JSON.parse(nimbusData);
+  createSignatureStorage(eventBus, signal) {
+    return new SignatureStorage(eventBus, signal);
+  }
+
+  dispatchGlobalEvent(event) {
+    FirefoxCom.request("dispatchGlobalEvent", event);
   }
 }
 
-export { DownloadManager, ExternalServices, FirefoxCom, Preferences };
+export { DownloadManager, ExternalServices, initCom, MLManager, Preferences };

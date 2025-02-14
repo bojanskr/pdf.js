@@ -23,6 +23,7 @@ import {
 } from "../shared/util.js";
 import { PostScriptLexer, PostScriptParser } from "./ps_parser.js";
 import { BaseStream } from "./base_stream.js";
+import { isNumberArray } from "./core_utils.js";
 import { LocalFunctionCache } from "./image_utils.js";
 
 class PDFFunctionFactory {
@@ -117,16 +118,9 @@ function toNumberArray(arr) {
   if (!Array.isArray(arr)) {
     return null;
   }
-  const length = arr.length;
-  for (let i = 0; i < length; i++) {
-    if (typeof arr[i] !== "number") {
-      // Non-number is found -- convert all items to numbers.
-      const result = new Array(length);
-      for (let j = 0; j < length; j++) {
-        result[j] = +arr[j];
-      }
-      return result;
-    }
+  if (!isNumberArray(arr, null)) {
+    // Non-number is found -- convert all items to numbers.
+    return arr.map(x => +x);
   }
   return arr;
 }
@@ -258,12 +252,9 @@ class PDFFunction {
       // Building the cube vertices: its part and sample index
       // http://rjwagner49.com/Mathematics/Interpolation.pdf
       const cubeVertices = 1 << inputSize;
-      const cubeN = new Float64Array(cubeVertices);
+      const cubeN = new Float64Array(cubeVertices).fill(1);
       const cubeVertex = new Uint32Array(cubeVertices);
       let i, j;
-      for (j = 0; j < cubeVertices; j++) {
-        cubeN[j] = 1;
-      }
 
       let k = outputSize,
         pos = 1;

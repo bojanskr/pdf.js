@@ -21,27 +21,24 @@
 /** @typedef {import("./display/api").PDFPageProxy} PDFPageProxy */
 /** @typedef {import("./display/api").RenderTask} RenderTask */
 /** @typedef {import("./display/display_utils").PageViewport} PageViewport */
-// eslint-disable-next-line max-len
-/** @typedef {import("./display/text_layer").TextLayerRenderTask} TextLayerRenderTask */
 
 import {
   AbortException,
   AnnotationEditorParamsType,
   AnnotationEditorType,
   AnnotationMode,
-  CMapCompressionType,
+  AnnotationType,
   createValidAbsoluteUrl,
   FeatureTest,
+  getUuid,
   ImageKind,
   InvalidPDFException,
-  MissingPDFException,
   normalizeUnicode,
   OPS,
   PasswordResponses,
   PermissionFlag,
-  PromiseCapability,
+  ResponseException,
   shadow,
-  UnexpectedResponseException,
   Util,
   VerbosityLevel,
 } from "./shared/util.js";
@@ -53,7 +50,6 @@ import {
   version,
 } from "./display/api.js";
 import {
-  DOMSVGFactory,
   fetchData,
   getFilenameFromUrl,
   getPdfFilenameFromUrl,
@@ -61,19 +57,25 @@ import {
   isDataScheme,
   isPdfFile,
   noContextMenu,
+  OutputScale,
   PDFDateString,
   PixelsPerInch,
   RenderingCancelledException,
   setLayerDimensions,
+  stopEvent,
+  SupportedImageMimeTypes,
 } from "./display/display_utils.js";
-import { renderTextLayer, updateTextLayer } from "./display/text_layer.js";
 import { AnnotationEditorLayer } from "./display/editor/annotation_editor_layer.js";
 import { AnnotationEditorUIManager } from "./display/editor/tools.js";
 import { AnnotationLayer } from "./display/annotation_layer.js";
 import { ColorPicker } from "./display/editor/color_picker.js";
+import { DOMSVGFactory } from "./display/svg_factory.js";
 import { DrawLayer } from "./display/draw_layer.js";
 import { GlobalWorkerOptions } from "./display/worker_options.js";
-import { Outliner } from "./display/editor/outliner.js";
+import { HighlightOutliner } from "./display/editor/drawers/highlight.js";
+import { SignatureExtractor } from "./display/editor/drawers/signaturedraw.js";
+import { TextLayer } from "./display/text_layer.js";
+import { TouchManager } from "./display/touch_manager.js";
 import { XfaLayer } from "./display/xfa_layer.js";
 
 /* eslint-disable-next-line no-unused-vars */
@@ -83,6 +85,12 @@ const pdfjsVersion =
 const pdfjsBuild =
   typeof PDFJSDev !== "undefined" ? PDFJSDev.eval("BUNDLE_BUILD") : void 0;
 
+if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("TESTING || GENERIC")) {
+  globalThis.pdfjsTestingUtils = {
+    HighlightOutliner,
+  };
+}
+
 export {
   AbortException,
   AnnotationEditorLayer,
@@ -91,8 +99,8 @@ export {
   AnnotationEditorUIManager,
   AnnotationLayer,
   AnnotationMode,
+  AnnotationType,
   build,
-  CMapCompressionType,
   ColorPicker,
   createValidAbsoluteUrl,
   DOMSVGFactory,
@@ -102,30 +110,32 @@ export {
   getDocument,
   getFilenameFromUrl,
   getPdfFilenameFromUrl,
+  getUuid,
   getXfaPageViewport,
   GlobalWorkerOptions,
   ImageKind,
   InvalidPDFException,
   isDataScheme,
   isPdfFile,
-  MissingPDFException,
   noContextMenu,
   normalizeUnicode,
   OPS,
-  Outliner,
+  OutputScale,
   PasswordResponses,
   PDFDataRangeTransport,
   PDFDateString,
   PDFWorker,
   PermissionFlag,
   PixelsPerInch,
-  PromiseCapability,
   RenderingCancelledException,
-  renderTextLayer,
+  ResponseException,
   setLayerDimensions,
   shadow,
-  UnexpectedResponseException,
-  updateTextLayer,
+  SignatureExtractor,
+  stopEvent,
+  SupportedImageMimeTypes,
+  TextLayer,
+  TouchManager,
   Util,
   VerbosityLevel,
   version,

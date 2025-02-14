@@ -12,7 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-/* globals pdfjsLib, pdfjsViewer */
+/* globals pdfjsLib, pdfjsTestingUtils, pdfjsViewer */
 
 const {
   AnnotationLayer,
@@ -20,18 +20,18 @@ const {
   DrawLayer,
   getDocument,
   GlobalWorkerOptions,
-  Outliner,
   PixelsPerInch,
-  PromiseCapability,
-  renderTextLayer,
   shadow,
+  TextLayer,
   XfaLayer,
 } = pdfjsLib;
+const { HighlightOutliner } = pdfjsTestingUtils;
 const { GenericL10n, parseQueryString, SimpleLinkService } = pdfjsViewer;
 
 const WAITING_TIME = 100; // ms
 const CMAP_URL = "/build/generic/web/cmaps/";
 const STANDARD_FONT_DATA_URL = "/build/generic/web/standard_fonts/";
+const WASM_URL = "/build/generic/web/wasm/";
 const IMAGE_RESOURCES_PATH = "/web/images/";
 const VIEWER_CSS = "../build/components/pdf_viewer.css";
 const VIEWER_LOCALE = "en-US";
@@ -215,6 +215,18 @@ class Rasterize {
     return { svg, foreignObject, style, div };
   }
 
+  static createRootCSS(viewport) {
+    const { scale, userUnit } = viewport;
+    return [
+      ":root {",
+      "  --scale-round-x: 1px; --scale-round-y: 1px;",
+      `  --scale-factor: ${scale};`,
+      `  --user-unit: ${userUnit};`,
+      `  --total-scale-factor: ${scale * userUnit};`,
+      "}",
+    ].join("\n");
+  }
+
   static async annotationLayer(
     ctx,
     viewport,
@@ -232,9 +244,7 @@ class Rasterize {
       div.className = "annotationLayer";
 
       const [common, overrides] = await this.annotationStylePromise;
-      style.textContent =
-        `${common}\n${overrides}\n` +
-        `:root { --scale-factor: ${viewport.scale} }`;
+      style.textContent = `${common}\n${overrides}\n${this.createRootCSS(viewport)}`;
 
       const annotationViewport = viewport.clone({ dontFlip: true });
       const annotationImageMap = await convertCanvasesToImages(
@@ -293,18 +303,15 @@ class Rasterize {
       svg.setAttribute("font-size", 1);
 
       const [common, overrides] = await this.textStylePromise;
-      style.textContent =
-        `${common}\n${overrides}\n` +
-        `:root { --scale-factor: ${viewport.scale} }`;
+      style.textContent = `${common}\n${overrides}\n${this.createRootCSS(viewport)}`;
 
       // Rendering text layer as HTML.
-      const task = renderTextLayer({
+      const textLayer = new TextLayer({
         textContentSource: textContent,
         container: div,
         viewport,
       });
-
-      await task.promise;
+      await textLayer.render();
 
       svg.append(foreignObject);
 
@@ -323,46 +330,39 @@ class Rasterize {
       svg.setAttribute("font-size", 1);
 
       const [common, overrides] = await this.drawLayerStylePromise;
-      style.textContent =
-        `${common}\n${overrides}` +
-        `:root { --scale-factor: ${viewport.scale} }`;
+      style.textContent = `${common}\n${overrides}\n${this.createRootCSS(viewport)}`;
 
       // Rendering text layer as HTML.
-      const task = renderTextLayer({
+      const textLayer = new TextLayer({
         textContentSource: textContent,
         container: dummyParent,
         viewport,
       });
+      await textLayer.render();
 
-      await task.promise;
-
-      const { _pageWidth, _pageHeight, _textContentSource, _textDivs } = task;
+      const { pageWidth, pageHeight, textDivs } = textLayer;
       const boxes = [];
-      let posRegex;
-      for (
-        let i = 0, j = 0, ii = _textContentSource.items.length;
-        i < ii;
-        i++
-      ) {
-        const { width, height, type } = _textContentSource.items[i];
+      let j = 0,
+        posRegex;
+      for (const { width, height, type } of textContent.items) {
         if (type) {
           continue;
         }
-        const { top, left } = _textDivs[j++].style;
+        const { top, left } = textDivs[j++].style;
         let x = parseFloat(left) / 100;
         let y = parseFloat(top) / 100;
         if (isNaN(x)) {
-          posRegex ||= /^calc\(var\(--scale-factor\)\*(.*)px\)$/;
+          posRegex ||= /^calc\(var\(--total-scale-factor\)\s*\*(.*)px\)$/;
           // The element is tagged so we've to extract the position from the
-          // string, e.g. `calc(var(--scale-factor)*66.32px)`.
+          // string, e.g. `calc(var(--total-scale-factor)*66.32px)`.
           let match = left.match(posRegex);
           if (match) {
-            x = parseFloat(match[1]) / _pageWidth;
+            x = parseFloat(match[1]) / pageWidth;
           }
 
           match = top.match(posRegex);
           if (match) {
-            y = parseFloat(match[1]) / _pageHeight;
+            y = parseFloat(match[1]) / pageHeight;
           }
         }
         if (width === 0 || height === 0) {
@@ -371,25 +371,57 @@ class Rasterize {
         boxes.push({
           x,
           y,
-          width: width / _pageWidth,
-          height: height / _pageHeight,
+          width: width / pageWidth,
+          height: height / pageHeight,
         });
       }
       // We set the borderWidth to 0.001 to slighly increase the size of the
       // boxes so that they can be merged together.
-      const outliner = new Outliner(boxes, /* borderWidth = */ 0.001);
+      const outliner = new HighlightOutliner(boxes, /* borderWidth = */ 0.001);
       // We set the borderWidth to 0.0025 in order to have an outline which is
       // slightly bigger than the highlight itself.
       // We must add an inner margin to avoid to have a partial outline.
-      const outlinerForOutline = new Outliner(
+      const outlinerForOutline = new HighlightOutliner(
         boxes,
         /* borderWidth = */ 0.0025,
         /* innerMargin = */ 0.001
       );
       const drawLayer = new DrawLayer({ pageIndex: 0 });
       drawLayer.setParent(div);
-      drawLayer.highlight(outliner.getOutlines(), "orange", 0.4);
-      drawLayer.highlightOutline(outlinerForOutline.getOutlines());
+      const outlines = outliner.getOutlines();
+      drawLayer.draw(
+        {
+          bbox: outlines.box,
+          root: {
+            viewBox: "0 0 1 1",
+            fill: "orange",
+            "fill-opacity": 0.4,
+          },
+          rootClass: {
+            highlight: true,
+            free: false,
+          },
+          path: {
+            d: outlines.toSVGPath(),
+          },
+        },
+        /* isPathUpdatable = */ false,
+        /* hasClip = */ true
+      );
+      const focusLine = outlinerForOutline.getOutlines();
+      drawLayer.drawOutline(
+        {
+          rootClass: {
+            highlightOutline: true,
+            free: false,
+          },
+          bbox: focusLine.box,
+          path: {
+            d: focusLine.toSVGPath(),
+          },
+        },
+        /* mustRemoveSelfIntersections = */ false
+      );
 
       svg.append(foreignObject);
 
@@ -397,7 +429,7 @@ class Rasterize {
 
       drawLayer.destroy();
     } catch (reason) {
-      throw new Error(`Rasterize.textLayer: "${reason?.message}".`);
+      throw new Error(`Rasterize.highlightLayer: "${reason?.message}".`);
     }
   }
 
@@ -599,12 +631,14 @@ class Driver {
         }
         const isOffscreenCanvasSupported =
           task.isOffscreenCanvasSupported === false ? false : undefined;
+        const disableFontFace = task.disableFontFace === true;
 
         const loadingTask = getDocument({
           url: new URL(task.file, window.location),
           password: task.password,
           cMapUrl: CMAP_URL,
           standardFontDataUrl: STANDARD_FONT_DATA_URL,
+          wasmUrl: WASM_URL,
           disableAutoFetch: !task.enableAutoFetch,
           pdfBug: true,
           useSystemFonts: task.useSystemFonts,
@@ -612,12 +646,13 @@ class Driver {
           enableXfa: task.enableXfa,
           isOffscreenCanvasSupported,
           styleElement: xfaStyleElement,
+          disableFontFace,
         });
         let promise = loadingTask.promise;
 
         if (task.annotationStorage) {
           for (const annotation of Object.values(task.annotationStorage)) {
-            const { bitmapName } = annotation;
+            const { bitmapName, quadPoints, paths, outlines } = annotation;
             if (bitmapName) {
               promise = promise.then(async doc => {
                 const response = await fetch(
@@ -649,6 +684,41 @@ class Driver {
 
                 return doc;
               });
+            }
+            if (quadPoints) {
+              // Just to ensure that the quadPoints are always a Float32Array
+              // like IRL (in order to avoid bugs like bug 1907958).
+              annotation.quadPoints = new Float32Array(quadPoints);
+            }
+            if (paths) {
+              for (let i = 0, ii = paths.lines.length; i < ii; i++) {
+                paths.lines[i] = Float32Array.from(
+                  paths.lines[i],
+                  x => x ?? NaN
+                );
+              }
+              for (let i = 0, ii = paths.points.length; i < ii; i++) {
+                paths.points[i] = Float32Array.from(
+                  paths.points[i],
+                  x => x ?? NaN
+                );
+              }
+            }
+            if (outlines) {
+              if (Array.isArray(outlines)) {
+                for (let i = 0, ii = outlines.length; i < ii; i++) {
+                  outlines[i] = Float32Array.from(outlines[i], x => x ?? NaN);
+                }
+              } else {
+                outlines.outline = Float32Array.from(
+                  outlines.outline,
+                  x => x ?? NaN
+                );
+                outlines.points = Float32Array.from(
+                  outlines.points,
+                  x => x ?? NaN
+                );
+              }
             }
           }
         }
@@ -684,7 +754,9 @@ class Driver {
             }
 
             task.pdfDoc = doc;
-            task.optionalContentConfigPromise = doc.getOptionalContentConfig();
+            task.optionalContentConfigPromise = doc.getOptionalContentConfig({
+              intent: task.print ? "print" : "display",
+            });
 
             if (task.optionalContent) {
               const entries = Object.entries(task.optionalContent),
@@ -745,7 +817,7 @@ class Driver {
     if (!("message" in e)) {
       return JSON.stringify(e);
     }
-    return e.message + ("stack" in e ? " at " + e.stack.split("\n")[0] : "");
+    return e.message + ("stack" in e ? " at " + e.stack.split("\n", 1)[0] : "");
   }
 
   _getLastPageNumber(task) {
@@ -782,7 +854,7 @@ class Driver {
       }
     }
 
-    if (task.skipPages && task.skipPages.includes(task.pageNum)) {
+    if (task.skipPages?.includes(task.pageNum)) {
       this._log(
         " Skipping page " + task.pageNum + "/" + task.pdfDoc.numPages + "...\n"
       );
@@ -1075,7 +1147,7 @@ class Driver {
       this.output.textContent += message;
     }
 
-    if (message.lastIndexOf("\n") >= 0 && !this.disableScrolling.checked) {
+    if (message.includes("\n") && !this.disableScrolling.checked) {
       // Scroll to the bottom of the page
       this.output.scrollTop = this.output.scrollHeight;
     }
@@ -1110,7 +1182,7 @@ class Driver {
   }
 
   _send(url, message) {
-    const capability = new PromiseCapability();
+    const { promise, resolve } = Promise.withResolvers();
     this.inflight.textContent = this.inFlightRequests++;
 
     fetch(url, {
@@ -1127,18 +1199,18 @@ class Driver {
         }
 
         this.inFlightRequests--;
-        capability.resolve();
+        resolve();
       })
       .catch(reason => {
-        console.warn(`Driver._send failed (${url}): ${reason}`);
+        console.warn(`Driver._send failed (${url}):`, reason);
 
         this.inFlightRequests--;
-        capability.resolve();
+        resolve();
 
         this._send(url, message);
       });
 
-    return capability.promise;
+    return promise;
   }
 }
 

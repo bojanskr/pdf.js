@@ -45,6 +45,40 @@
       "type": "boolean",
       "default": false
     },
+    "enableHWA": {
+      "title": "Enable hardware acceleration",
+      "description": "Whether to enable hardware acceleration.",
+      "type": "boolean",
+      "default": true
+    },
+    "enableAltText": {
+      "type": "boolean",
+      "default": false
+    },
+    "enableGuessAltText": {
+      "type": "boolean",
+      "default": true
+    },
+    "enableAltTextModelDownload": {
+      "type": "boolean",
+      "default": true
+    },
+    "enableNewAltTextWhenAddingImage": {
+      "type": "boolean",
+      "default": true
+    },
+    "altTextLearnMoreUrl": {
+      "type": "string",
+      "default": ""
+    },
+    "enableSignatureEditor": {
+      "type": "boolean",
+      "default": false
+    },
+    "enableUpdatedAddImage": {
+      "type": "boolean",
+      "default": false
+    },
     "cursorToolOnLoad": {
       "title": "Cursor tool on load",
       "description": "The cursor tool that is enabled upon load.\n 0 = Text selection tool.\n 1 = Hand tool.",
@@ -64,7 +98,7 @@
       "description": "Whether to allow execution of active content (JavaScript) by PDF files.",
       "default": false
     },
-    "enableHighlightEditor": {
+    "enableHighlightFloatingButton": {
       "type": "boolean",
       "default": false
     },
@@ -190,6 +224,11 @@
       "description": "The color is a string as defined in CSS. Its goal is to help improve readability in high contrast mode",
       "type": "string",
       "default": "CanvasText"
+    },
+    "enableAutoLinking": {
+      "description": "Enable creation of hyperlinks from text that look like URLs.",
+      "type": "boolean",
+      "default": false
     }
   }
 }
